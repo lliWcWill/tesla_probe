@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Tesla Browser Probe</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b0d10; --card:#14181d; --line:#262c34; --fg:#e8edf2; --mut:#8b97a6; --ok:#22c55e; --bad:#ef4444; --warn:#f59e0b; --accent:#e11d2a; box-sizing:border-box; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,system-ui,sans-serif; padding:16px 14px calc(40px + env(safe-area-inset-bottom)); }
+  h1 { font-size:19px; margin:0 0 2px; }
+  .sub { color:var(--mut); font-size:13px; margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .card h2 { font-size:14px; margin:0 0 10px; letter-spacing:.3px; text-transform:uppercase; color:var(--mut); }
+  .row { display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px solid var(--line); font-size:14px; }
+  .row:last-child { border-bottom:0; }
+  .row .k { color:var(--mut); }
+  .row .v { text-align:right; font-variant-numeric:tabular-nums; font-weight:600; }
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .mut{color:var(--mut)}
+  .verdict { font-size:16px; font-weight:800; padding:10px 12px; border-radius:10px; margin-top:4px; text-align:center; }
+  .vok{background:rgba(34,197,94,.12); color:var(--ok); border:1px solid rgba(34,197,94,.35)}
+  .vbad{background:rgba(239,68,68,.12); color:var(--bad); border:1px solid rgba(239,68,68,.35)}
+  .vwait{background:rgba(139,151,166,.1); color:var(--mut); border:1px solid var(--line)}
+  button { -webkit-appearance:none; appearance:none; border:1px solid var(--line); background:#1b2127; color:var(--fg); font-size:15px; font-weight:600; padding:12px 14px; border-radius:10px; width:100%; margin-top:8px; }
+  button.primary { background:var(--accent); border-color:var(--accent); }
+  button:active { opacity:.8; }
+  .btns2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  canvas { width:100%; max-height:200px; object-fit:contain; background:#000; border-radius:8px; border:1px solid var(--line); margin-top:8px; }
+  input[type=text] { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0f1317; color:var(--fg); font-size:13px; margin-top:6px; }
+  .hint { font-size:12px; color:var(--mut); margin-top:8px; }
+  .snap { font-size:13px; }
+  .snap .lbl { display:inline-block; min-width:52px; color:var(--mut); }
+  .big { font-size:17px; font-weight:800; }
+</style>
+</head>
+<body>
+  <h1>Tesla Browser Probe</h1>
+  <p class="sub">Answers two questions: does WebCodecs actually <em>decode</em> here, and which render path survives <b>Drive</b>. Nothing more.</p>
+
+  <div class="card">
+    <h2>1 · Environment (exposure, not proof)</h2>
+    <div id="env"></div>
+  </div>
+
+  <div class="card">
+    <h2>Video source</h2>
+    <div class="hint">Auto-tries <code>./sample.mp4</code> next to this page. Or pick a file / paste a URL. Short H.264 MP4 is ideal.</div>
+    <input type="text" id="url" placeholder="optional: https://.../clip.mp4 (must allow CORS)" />
+    <button onclick="pickFile()">Choose a file instead</button>
+    <input type="file" id="file" accept="video/*" style="display:none" />
+    <button class="primary" id="run" onclick="runAll()">▶ Run all tests</button>
+    <div class="hint" id="srcinfo">source: ./sample.mp4 (default)</div>
+  </div>
+
+  <div class="card">
+    <h2>2 · WebCodecs real decode (Technique B)</h2>
+    <div id="wc"></div>
+    <div id="wcVerdict" class="verdict vwait">waiting</div>
+    <canvas id="cvB" width="320" height="180"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>3 · Hidden-video → drawImage (Technique A)</h2>
+    <div id="hv"></div>
+    <div id="hvVerdict" class="verdict vwait">waiting</div>
+    <canvas id="cvA" width="320" height="180"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>4 · Park / Drive A/B · the money test</h2>
+    <div class="hint">Run tests in <b>Park</b> → Save PARK. Then (as passenger / safely) with the car in <b>Drive</b>, the loops keep running live → Save DRIVE. Compare tells you which surface Tesla touches.</div>
+    <div class="btns2">
+      <button onclick="snap('PARK')">Save PARK</button>
+      <button onclick="snap('DRIVE')">Save DRIVE</button>
+    </div>
+    <button onclick="clearSnaps()">Clear snapshots</button>
+    <div id="cmp" style="margin-top:12px"></div>
+  </div>
+
+<script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const row = (k,v,cls='') => `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
+let chosenFile = null;
+
+// live-updated state the snapshots read from
+const live = {
+  B: { frames:0, luma:-1, state:'-', err:'' },
+  A: { time:0, advancing:false, luma:-1, ready:0, err:'' }
+};
+
+function pickFile(){ $('#file').click(); }
+$('#file').addEventListener('change', e => {
+  chosenFile = e.target.files[0] || null;
+  if (chosenFile) $('#srcinfo').textContent = 'source: ' + chosenFile.name;
+});
+
+// ---------- Section 1: environment ----------
+async function showEnv(){
+  const has = n => (n in window);
+  let cfg = 'n/a';
+  if (has('VideoDecoder')) {
+    try {
+      const r = await VideoDecoder.isConfigSupported({ codec:'avc1.42E01E', codedWidth:1280, codedHeight:720 });
+      cfg = r.supported ? ('supported · hw:' + (r.config?.hardwareAcceleration || '?')) : 'NOT supported';
+    } catch(e){ cfg = 'error: ' + e.message; }
+  }
+  const ua = navigator.userAgent;
+  const chrome = (ua.match(/Chrome\/(\d+)/) || [,'?'])[1];
+  $('#env').innerHTML =
+    row('Secure context (HTTPS)', isSecureContext ? 'yes' : 'NO — WebCodecs will fail', isSecureContext?'ok':'bad') +
+    row('Chrome build', chrome) +
+    row('VideoDecoder', has('VideoDecoder')?'present':'MISSING', has('VideoDecoder')?'ok':'bad') +
+    row('AudioDecoder', has('AudioDecoder')?'present':'missing', has('AudioDecoder')?'ok':'warn') +
+    row('VideoFrame', has('VideoFrame')?'present':'missing', has('VideoFrame')?'ok':'bad') +
+    row('H.264 config', cfg, cfg.startsWith('supported')?'ok':'warn') +
+    row('WebGL', testGL()?'yes':'no', testGL()?'ok':'warn') +
+    row('createImageBitmap', has('createImageBitmap')?'yes':'no') +
+    row('MediaSource (MSE)', has('MediaSource')?'yes':'no') +
+    row('WebSocket', has('WebSocket')?'yes':'no') +
+    row('UA', '<span class="mut" style="font-size:11px">'+ua.replace(/</g,'&lt;')+'</span>');
+}
+function testGL(){ try { const c=document.createElement('canvas'); return !!(c.getContext('webgl')||c.getContext('experimental-webgl')); } catch(e){ return false; } }
+
+// ---------- helpers ----------
+function lumaOf(ctx, w, h){
+  try {
+    const d = ctx.getImageData(0,0,w,h).data;
+    let sum=0, n=0, max=0;
+    for (let i=0;i<d.length;i+=4*97){ const l=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; sum+=l; max=Math.max(max,l); n++; }
+    return { avg: +(sum/n).toFixed(1), max:+max.toFixed(0) };
+  } catch(e){ return { avg:-1, max:-1, err:e.message }; }
+}
+async function getBuffer(){
+  if (chosenFile){ const ab = await chosenFile.arrayBuffer(); ab.fileStart=0; return ab; }
+  const u = $('#url').value.trim() || './sample.mp4';
+  const res = await fetch(u);
+  if (!res.ok) throw new Error('fetch '+res.status+' for '+u);
+  const ab = await res.arrayBuffer(); ab.fileStart=0; return ab;
+}
+function getURLForVideoEl(){
+  if (chosenFile) return URL.createObjectURL(chosenFile);
+  return ($('#url').value.trim() || './sample.mp4');
+}
+
+// ---------- Section 2: real WebCodecs decode ----------
+async function testWebCodecs(){
+  const wc = $('#wc'), v = $('#wcVerdict'), canvas = $('#cvB'), ctx = canvas.getContext('2d');
+  live.B = { frames:0, luma:-1, state:'init', err:'' };
+  v.className='verdict vwait'; v.textContent='decoding…';
+  if (!('VideoDecoder' in window)){ wc.innerHTML=row('result','VideoDecoder missing','bad'); v.className='verdict vbad'; v.textContent='FAILS — API not present'; live.B.state='no-api'; return; }
+
+  let decoded=0, errored='';
+  try {
+    const buf = await getBuffer();
+    const mp4 = MP4Box.createFile();
+    const DS = window.DataStream || MP4Box.DataStream;
+
+    const ready = new Promise((resolve,reject)=>{
+      mp4.onError = e => reject(new Error('mp4box: '+e));
+      mp4.onReady = info => resolve(info);
+    });
+    mp4.appendBuffer(buf); mp4.flush();
+    const info = await ready;
+    const vt = info.videoTracks[0];
+    if (!vt) throw new Error('no video track in file');
+
+    // pull codec description (avcC/hvcC) out of the sample entry
+    let description;
+    const trak = mp4.getTrackById(vt.id);
+    for (const e of trak.mdia.minf.stbl.stsd.entries){
+      const box = e.avcC || e.hvcC || e.vpcC || e.av1C;
+      if (box){ const s = new DS(undefined,0,DS.BIG_ENDIAN); box.write(s); description = new Uint8Array(s.buffer, 8); break; }
+    }
+
+    const dec = new VideoDecoder({
+      output: frame => {
+        decoded++; live.B.frames=decoded;
+        if (decoded<=8 || decoded%5===0){
+          ctx.drawImage(frame,0,0,canvas.width,canvas.height);
+          const l=lumaOf(ctx,canvas.width,canvas.height); live.B.luma=l.avg;
+        }
+        frame.close();
+      },
+      error: e => { errored=e.message; live.B.err=e.message; }
+    });
+    dec.configure({ codec: vt.codec, codedWidth: vt.track_width, codedHeight: vt.track_height, description });
+    live.B.state='configured';
+
+    const samples = await new Promise(resolve=>{
+      const out=[];
+      mp4.onSamples=(id,u,s)=>{ out.push(...s); if(out.length>=48) resolve(out.slice(0,48)); };
+      mp4.setExtractionOptions(vt.id,null,{nbSamples:48});
+      mp4.start();
+      setTimeout(()=>resolve(out),1500);
+    });
+    for (const s of samples){
+      dec.decode(new EncodedVideoChunk({ type: s.is_sync?'key':'delta', timestamp: s.cts, duration: s.duration, data: s.data }));
+    }
+    await dec.flush();
+    live.B.state = dec.state;
+
+    const ldesc = live.B.luma<0 ? 'n/a' : (live.B.luma+' avg luma');
+    wc.innerHTML =
+      row('codec', vt.codec) +
+      row('frames DECODED', decoded, decoded>0?'ok':'bad') +
+      row('rendered to canvas', ldesc, live.B.luma>8?'ok':(live.B.luma<0?'mut':'warn')) +
+      row('decoder errors', errored||'none', errored?'bad':'ok');
+
+    if (decoded>0 && live.B.luma>8){ v.className='verdict vok'; v.textContent='WORKS — real decode + non-black render'; }
+    else if (decoded>0){ v.className='verdict vwait'; v.textContent='decoded, but canvas looks dark — inspect'; }
+    else { v.className='verdict vbad'; v.textContent='FAILS — zero frames decoded'; }
+  } catch(e){
+    live.B.err=e.message;
+    wc.innerHTML=row('error',e.message,'bad');
+    v.className='verdict vbad'; v.textContent='FAILS — '+e.message;
+  }
+}
+
+// ---------- Section 3: hidden video -> drawImage ----------
+let hvRAF=null, hvEl=null;
+async function testHiddenVideo(){
+  const hv=$('#hv'), v=$('#hvVerdict'), canvas=$('#cvA'), ctx=canvas.getContext('2d',{alpha:false});
+  live.A={ time:0, advancing:false, luma:-1, ready:0, err:'' };
+  v.className='verdict vwait'; v.textContent='playing…';
+  if (hvRAF) cancelAnimationFrame(hvRAF);
+  if (hvEl){ try{hvEl.pause();hvEl.remove();}catch(e){} }
+
+  const vid=document.createElement('video');
+  hvEl=vid; vid.muted=true; vid.playsInline=true; vid.crossOrigin='anonymous';
+  vid.style.position='fixed'; vid.style.left='-9999px'; vid.width=2; vid.height=2;
+  vid.src=getURLForVideoEl(); document.body.appendChild(vid);
+
+  vid.onerror=()=>{ live.A.err='video load error'; render(); };
+  try { await vid.play(); } catch(e){ live.A.err='play(): '+e.message; }
+
+  let last=-1, lastChange=performance.now();
+  function loop(){
+    live.A.ready=vid.readyState;
+    if (vid.readyState>=2){
+      ctx.drawImage(vid,0,0,canvas.width,canvas.height);
+      const l=lumaOf(ctx,canvas.width,canvas.height); live.A.luma=l.avg;
+    }
+    live.A.time=+vid.currentTime.toFixed(2);
+    if (vid.currentTime!==last){ last=vid.currentTime; lastChange=performance.now(); }
+    live.A.advancing = (performance.now()-lastChange) < 700;
+    render();
+    hvRAF=requestAnimationFrame(loop);
+  }
+  function render(){
+    hv.innerHTML =
+      row('video.currentTime', live.A.time+'s', 'mut') +
+      row('time advancing', live.A.advancing?'yes':'NO (frozen)', live.A.advancing?'ok':'bad') +
+      row('readyState', live.A.ready, live.A.ready>=2?'ok':'warn') +
+      row('canvas luma', live.A.luma<0?'n/a':live.A.luma+(live.A.luma<=6?' (BLACK)':''), live.A.luma>6?'ok':(live.A.luma<0?'mut':'bad')) +
+      row('error', live.A.err||'none', live.A.err?'bad':'ok');
+    if (live.A.err){ v.className='verdict vbad'; v.textContent='load/play error'; }
+    else if (live.A.advancing && live.A.luma>6){ v.className='verdict vok'; v.textContent='WORKS — playing + non-black'; }
+    else if (!live.A.advancing || live.A.luma<=6){ v.className='verdict vbad'; v.textContent='BLOCKED — frozen or black'; }
+  }
+  hvRAF=requestAnimationFrame(loop);
+}
+
+// ---------- run all ----------
+async function runAll(){
+  $('#run').textContent='running…';
+  await testWebCodecs();
+  await testHiddenVideo();
+  $('#run').textContent='▶ Re-run tests';
+}
+
+// ---------- Section 4: snapshots ----------
+const KEY='teslaProbeSnaps';
+function snap(mode){
+  const all=JSON.parse(localStorage.getItem(KEY)||'{}');
+  all[mode]={ t:new Date().toLocaleTimeString(),
+    B:{...live.B}, A:{...live.A} };
+  localStorage.setItem(KEY,JSON.stringify(all));
+  drawCmp();
+}
+function clearSnaps(){ localStorage.removeItem(KEY); drawCmp(); }
+function drawCmp(){
+  const all=JSON.parse(localStorage.getItem(KEY)||'{}');
+  const fmt=(s)=> s ? `<div class="snap">
+      <div class="big">${s===all.PARK?'PARK':'DRIVE'} <span class="mut" style="font-size:11px">${s.t}</span></div>
+      <div><span class="lbl">Tech A</span> ${s.A.advancing&&s.A.luma>6?'<span class="ok">plays</span>':'<span class="bad">blocked</span>'} · luma ${s.A.luma} · time ${s.A.time}s</div>
+      <div><span class="lbl">Tech B</span> ${s.B.frames>0&&s.B.luma>8?'<span class="ok">decodes</span>':'<span class="bad">no</span>'} · frames ${s.B.frames} · luma ${s.B.luma}</div>
+    </div>` : '';
+  let out='';
+  out += all.PARK?fmt(all.PARK):'<div class="mut snap">No PARK snapshot yet.</div>';
+  out += '<div style="height:8px"></div>';
+  out += all.DRIVE?fmt(all.DRIVE):'<div class="mut snap">No DRIVE snapshot yet.</div>';
+  if (all.PARK && all.DRIVE){
+    const aSurv = (all.DRIVE.A.advancing && all.DRIVE.A.luma>6);
+    const bSurv = (all.DRIVE.B.frames>0 && all.DRIVE.B.luma>8);
+    let verdict, cls;
+    if (bSurv && !aSurv){ verdict='Tesla touches the media element only. Technique B (WebCodecs) is your path.'; cls='vok'; }
+    else if (aSurv && bSurv){ verdict='Nothing blocks in Drive on your build — even Technique A survives. Easiest path wins.'; cls='vok'; }
+    else if (!aSurv && !bSurv){ verdict='Both blocked in Drive. The restriction is below the render layer — neither canvas trick works here.'; cls='vbad'; }
+    else { verdict='Only A survived, B failed to decode — likely a decode/file issue, not a gear block. Re-check Section 2.'; cls='vwait'; }
+    out += `<div class="verdict ${cls}" style="margin-top:12px">${verdict}</div>`;
+  }
+  $('#cmp').innerHTML=out;
+}
+
+showEnv(); drawCmp();
+</script>
+</body>
+</html>
