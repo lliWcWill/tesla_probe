@@ -20,11 +20,14 @@
   .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .mut{color:var(--mut)}
   button { -webkit-appearance:none; appearance:none; border:1px solid var(--line); background:#1b2127; color:var(--fg); font-size:15px; font-weight:600; padding:12px 14px; border-radius:10px; width:100%; margin-top:8px; }
   button.primary { background:var(--accent); border-color:var(--accent); }
+  button.on { background:#1f6feb; border-color:#1f6feb; }
   button:active { opacity:.8; }
   .btns2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .btns3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
   input[type=text] { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:#0f1317; color:var(--fg); font-size:13px; margin-top:6px; }
   label.chk { display:flex; align-items:center; gap:8px; font-size:14px; margin-top:10px; }
   .hint { font-size:12px; color:var(--mut); margin-top:8px; }
+  #srcnow { margin:12px 0 4px; font-size:14px; font-weight:700; color:var(--fg); }
   #status { font-size:13px; font-weight:600; margin-top:8px; }
 </style>
 </head>
@@ -34,12 +37,21 @@
 
   <div class="card">
     <canvas id="cv" width="320" height="180"></canvas>
+
+    <div id="srcnow">source: built-in clip</div>
+    <div class="btns3">
+      <button id="b-embed" class="on" onclick="pickSource('','b-embed')">Built-in</button>
+      <button id="b-720" onclick="pickSource('clip720.mp4','b-720')">720p</button>
+      <button id="b-1080" onclick="pickSource('clip1080.mp4','b-1080')">1080p</button>
+    </div>
+
     <div class="btns2">
       <button class="primary" id="play" onclick="toggle()">&#9654; Play</button>
-      <button onclick="reloadSrc()">Load source</button>
+      <button onclick="reloadSrc()">Reload</button>
     </div>
     <label class="chk"><input type="checkbox" id="loop" checked /> Loop</label>
-    <input type="text" id="src" placeholder="blank = built-in clip &middot; or a same-origin path like clip720.mp4 &middot; or a CORS URL" />
+    <input type="text" id="src" placeholder="custom: same-origin path or CORS URL" />
+    <button onclick="pickCustom()">Load typed path</button>
     <button onclick="pickFile()">Choose a file (phone only)</button>
     <input type="file" id="file" accept="video/*" style="display:none" />
     <div id="status" class="mut">idle</div>
@@ -67,7 +79,19 @@ let rafId = null, feedId = null;
 
 function setStatus(t,cls='mut'){ const s=$('#status'); s.textContent=t; s.className=cls; }
 function pickFile(){ $('#file').click(); }
-$('#file').addEventListener('change', e => { chosenFile = e.target.files[0]||null; if(chosenFile){ $('#src').value=''; setStatus('file chosen: '+chosenFile.name); loaded=false; } });
+$('#file').addEventListener('change', e => { chosenFile = e.target.files[0]||null; if(chosenFile){ $('#src').value=''; setActive(null); loaded=false; updateSrcName(); } });
+
+function srcLabel(){
+  if (chosenFile) return chosenFile.name;
+  const u = $('#src').value.trim();
+  return u || 'built-in clip';
+}
+function updateSrcName(){
+  $('#srcnow').textContent = 'source: ' + srcLabel() + (loaded && V.w ? '  \u2014  ' + V.w + 'x' + V.h : '');
+}
+function setActive(id){
+  ['b-embed','b-720','b-1080'].forEach(x=>{ const el=$('#'+x); if(el) el.classList.toggle('on', x===id); });
+}
 
 function srcValue(){
   if (chosenFile) return chosenFile;
@@ -79,7 +103,7 @@ async function getBuffer(){
   const src = srcValue();
   if (src instanceof File){ const ab = await src.arrayBuffer(); ab.fileStart=0; return ab; }
   const res = await fetch(src);
-  if (!res.ok) throw new Error('fetch '+res.status);
+  if (!res.ok) throw new Error('fetch '+res.status+' (uploaded yet?)');
   const ab = await res.arrayBuffer(); ab.fileStart=0; return ab;
 }
 
@@ -113,6 +137,7 @@ async function load(){
   if (!V.samples.length) throw new Error('no samples extracted');
   loaded = true;
   cv.width = V.w; cv.height = V.h;
+  updateSrcName();
   setStatus('loaded '+V.samples.length+' frames @ '+V.w+'x'+V.h+' ('+V.codec+')','ok');
 }
 
@@ -181,16 +206,17 @@ function updateHUD(clock){
     row('decoder state', dec?dec.state:'-');
 }
 
+async function ensureLoadedAndPlay(){
+  if (!loaded) await load();
+  if (!dec || dec.state==='closed') makeDecoder();
+  playing=true; $('#play').innerHTML='&#10073;&#10073; Pause';
+  startClock=performance.now(); lastFpsT=performance.now();
+  feed(); rafId=requestAnimationFrame(render);
+  setStatus('playing','ok');
+}
 async function toggle(){
   if (playing){ pause(); return; }
-  try {
-    if (!loaded) await load();
-    if (!dec || dec.state==='closed') makeDecoder();
-    playing=true; $('#play').innerHTML='&#10073;&#10073; Pause';
-    startClock=performance.now(); lastFpsT=performance.now();
-    feed(); rafId=requestAnimationFrame(render);
-    setStatus('playing','ok');
-  } catch(e){ setStatus('error: '+e.message,'bad'); }
+  try { await ensureLoadedAndPlay(); } catch(e){ setStatus('error: '+e.message,'bad'); }
 }
 function pause(){
   if (!playing) return;
@@ -200,13 +226,30 @@ function pause(){
   baseT = baseT + (performance.now()-startClock)/1000;
   setStatus('paused','mut');
 }
-function reloadSrc(){
-  pause(); loaded=false; sampleIdx=0; baseT=0; drawn=0; dropped=0;
+function resetState(){
+  pause(); loaded=false; sampleIdx=0; baseT=0; drawn=0; dropped=0; fps=0; fpsCount=0; lastRes='-'; V.w=0;
   frameQueue.forEach(o=>o.frame.close()); frameQueue=[];
   if (dec){ try{dec.close();}catch(e){} dec=null; }
-  load().catch(e=>setStatus('error: '+e.message,'bad'));
+}
+async function pickSource(v, btnId){
+  resetState();
+  chosenFile=null; $('#file').value=''; $('#src').value=v; setActive(btnId);
+  updateSrcName();
+  try { await ensureLoadedAndPlay(); updateSrcName(); } catch(e){ setStatus('error: '+e.message,'bad'); }
+}
+async function pickCustom(){
+  resetState();
+  chosenFile=null; setActive(null);
+  updateSrcName();
+  try { await ensureLoadedAndPlay(); updateSrcName(); } catch(e){ setStatus('error: '+e.message,'bad'); }
+}
+function reloadSrc(){
+  resetState();
+  updateSrcName();
+  load().then(updateSrcName).catch(e=>setStatus('error: '+e.message,'bad'));
 }
 
+updateSrcName();
 updateHUD(0);
 </script>
 </body>
