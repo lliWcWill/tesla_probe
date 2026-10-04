@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-<title>WebCodecs Player</title>
+<title>WebCodecs Player + Audio</title>
 <style>
   :root { color-scheme: dark; --bg:#0b0d10; --card:#14181d; --line:#262c34; --fg:#e8edf2; --mut:#8b97a6; --ok:#22c55e; --bad:#ef4444; --warn:#f59e0b; --accent:#e11d2a; box-sizing:border-box; }
   * { box-sizing:border-box; }
@@ -32,8 +32,8 @@
 </style>
 </head>
 <body>
-  <h1>WebCodecs Player</h1>
-  <p class="sub">Continuous demux &rarr; decode &rarr; paced canvas render. The sustained-decode instrument + real player skeleton. Video only (audio is Phase 2).</p>
+  <h1>WebCodecs Player + Audio</h1>
+  <p class="sub">Full WebCodecs: video on canvas, audio decoded to WebAudio as the master clock. No media element anywhere.</p>
 
   <div class="card">
     <canvas id="cv" width="320" height="180"></canvas>
@@ -58,9 +58,9 @@
   </div>
 
   <div class="card">
-    <h2>Performance HUD &middot; the sustained-decode verdict</h2>
+    <h2>Performance HUD &middot; video + audio sync</h2>
     <div id="hud"></div>
-    <div class="hint">If <b>dropped</b> climbs and <b>fps</b> sits well under the clip's rate, this Atom can't sustain that resolution. Flat dropped + fps at clip rate = it holds.</div>
+    <div class="hint">Audio is master clock. <b>A/V drift</b> near 0 ms = in sync. Audio shows "off" on the silent 720/1080 test clips (audio was stripped from those) &mdash; use Built-in to test sound.</div>
   </div>
 
 <script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.2/dist/mp4box.all.min.js"></script>
@@ -71,33 +71,24 @@ const row = (k,v,cls='') => `<div class="row"><span class="k">${k}</span><span c
 const cv = $('#cv'), ctx = cv.getContext('2d', { alpha:false });
 
 let chosenFile = null;
-let V = { samples:[], timescale:1, cfg:null, w:0, h:0, codec:'', fileFps:0 };
+let V = { samples:[], timescale:1, cfg:null, w:0, h:0, codec:'', fileFps:0, hasAudio:false };
 let dec = null, frameQueue = [], sampleIdx = 0;
-let playing = false, startClock = 0, baseT = 0;
-let drawn = 0, dropped = 0, fpsCount = 0, fps = 0, lastFpsT = 0, lastRes = '-', loaded = false;
+let playing = false, started = false, startClock = 0, baseT = 0;
+let drawn = 0, dropped = 0, fpsCount = 0, fps = 0, lastFpsT = 0, lastRes = '-', loaded = false, lastVideoPts = 0;
 let rafId = null, feedId = null;
+
+// audio
+let audioCtx = null, audioDec = null, aSamples = [], aIdx = 0, aTimescale = 1, aCfg = null;
+let aSampleRate = 0, aChannels = 0, epochStart = 0, audioActive = false, scheduledSources = [], aFeedId = null;
 
 function setStatus(t,cls='mut'){ const s=$('#status'); s.textContent=t; s.className=cls; }
 function pickFile(){ $('#file').click(); }
-$('#file').addEventListener('change', e => { chosenFile = e.target.files[0]||null; if(chosenFile){ $('#src').value=''; setActive(null); loaded=false; updateSrcName(); } });
+$('#file').addEventListener('change', e => { chosenFile = e.target.files[0]||null; if(chosenFile){ $('#src').value=''; setActive(null); loaded=false; started=false; updateSrcName(); } });
 
-function srcLabel(){
-  if (chosenFile) return chosenFile.name;
-  const u = $('#src').value.trim();
-  return u || 'built-in clip';
-}
-function updateSrcName(){
-  $('#srcnow').textContent = 'source: ' + srcLabel() + (loaded && V.w ? '  \u2014  ' + V.w + 'x' + V.h : '');
-}
-function setActive(id){
-  ['b-embed','b-720','b-1080'].forEach(x=>{ const el=$('#'+x); if(el) el.classList.toggle('on', x===id); });
-}
-
-function srcValue(){
-  if (chosenFile) return chosenFile;
-  const u = $('#src').value.trim();
-  return u || EMBEDDED;
-}
+function srcLabel(){ if (chosenFile) return chosenFile.name; const u=$('#src').value.trim(); return u||'built-in clip'; }
+function updateSrcName(){ $('#srcnow').textContent = 'source: ' + srcLabel() + (loaded && V.w ? '  \u2014  ' + V.w + 'x' + V.h + (V.hasAudio?' +audio':' (silent)') : ''); }
+function setActive(id){ ['b-embed','b-720','b-1080'].forEach(x=>{ const el=$('#'+x); if(el) el.classList.toggle('on', x===id); }); }
+function srcValue(){ if (chosenFile) return chosenFile; const u=$('#src').value.trim(); return u||EMBEDDED; }
 
 async function getBuffer(){
   const src = srcValue();
@@ -107,6 +98,8 @@ async function getBuffer(){
   const ab = await res.arrayBuffer(); ab.fileStart=0; return ab;
 }
 
+function findDSI(descs){ for(const d of descs||[]){ if(d && d.tag===5 && d.data) return d.data; if(d && d.descs){ const r=findDSI(d.descs); if(r) return r; } } return null; }
+
 async function load(){
   setStatus('demuxing...','warn');
   const buf = await getBuffer();
@@ -115,142 +108,197 @@ async function load(){
   const info = await new Promise((ok,err)=>{ mp4.onError=e=>err(new Error('mp4box: '+e)); mp4.onReady=ok; mp4.appendBuffer(buf); mp4.flush(); });
   const vt = info.videoTracks[0];
   if (!vt) throw new Error('no video track');
+  const at = info.audioTracks && info.audioTracks[0];
 
-  V.timescale = vt.timescale; V.w = vt.track_width; V.h = vt.track_height; V.codec = vt.codec;
-  V.fileFps = vt.nb_samples && info.duration ? +(vt.nb_samples / (info.duration/info.timescale)).toFixed(1) : 0;
+  V.timescale=vt.timescale; V.w=vt.track_width; V.h=vt.track_height; V.codec=vt.codec;
+  V.fileFps = vt.nb_samples && info.duration ? +(vt.nb_samples/(info.duration/info.timescale)).toFixed(1) : 0;
 
-  let description;
-  const trak = mp4.getTrackById(vt.id);
-  for (const e of trak.mdia.minf.stbl.stsd.entries){
-    const b = e.avcC||e.hvcC||e.av1C||e.vpcC;
-    if (b){ const s=new DS(undefined,0,DS.BIG_ENDIAN); b.write(s); description=new Uint8Array(s.buffer,8); break; }
+  let vdesc;
+  const vtrak = mp4.getTrackById(vt.id);
+  for (const e of vtrak.mdia.minf.stbl.stsd.entries){ const b=e.avcC||e.hvcC||e.av1C||e.vpcC; if(b){ const s=new DS(undefined,0,DS.BIG_ENDIAN); b.write(s); vdesc=new Uint8Array(s.buffer,8); break; } }
+  V.cfg = { codec: vt.codec, codedWidth: vt.track_width, codedHeight: vt.track_height, description: vdesc, optimizeForLatency:true };
+
+  V.hasAudio=false; aSamples=[]; aCfg=null;
+  if (at){
+    try {
+      aTimescale=at.timescale; aSampleRate=at.audio.sample_rate; aChannels=at.audio.channel_count;
+      let adesc; const atrak=mp4.getTrackById(at.id);
+      for (const e of atrak.mdia.minf.stbl.stsd.entries){ if(e.esds && e.esds.esd){ adesc=findDSI(e.esds.esd.descs); } }
+      aCfg = { codec: at.codec, sampleRate: aSampleRate, numberOfChannels: aChannels };
+      if (adesc) aCfg.description = adesc;
+      V.hasAudio = true;
+    } catch(e){ V.hasAudio=false; }
   }
-  V.cfg = { codec: vt.codec, codedWidth: vt.track_width, codedHeight: vt.track_height, description, optimizeForLatency:true };
 
-  V.samples = await new Promise(resolve=>{
-    const out=[];
-    mp4.onSamples=(id,u,s)=>{ out.push(...s); if(out.length>=vt.nb_samples) resolve(out); };
+  // single extraction pass for both tracks
+  const vOut=[], aOut=[];
+  await new Promise(resolve=>{
+    mp4.onSamples=(id,u,s)=>{
+      if (id===vt.id) vOut.push(...s);
+      else if (at && id===at.id) aOut.push(...s);
+      if (vOut.length>=vt.nb_samples && (!at || aOut.length>=at.nb_samples)) resolve();
+    };
     mp4.setExtractionOptions(vt.id,null,{nbSamples:vt.nb_samples});
+    if (at) mp4.setExtractionOptions(at.id,null,{nbSamples:at.nb_samples});
     mp4.start();
-    setTimeout(()=>resolve(out),6000);
+    setTimeout(resolve,6000);
   });
-  if (!V.samples.length) throw new Error('no samples extracted');
-  loaded = true;
-  cv.width = V.w; cv.height = V.h;
-  updateSrcName();
-  setStatus('loaded '+V.samples.length+' frames @ '+V.w+'x'+V.h+' ('+V.codec+')','ok');
+  V.samples=vOut; aSamples=aOut;
+  if (!V.samples.length) throw new Error('no video samples');
+  if (V.hasAudio && !aSamples.length) V.hasAudio=false;
+
+  loaded=true; cv.width=V.w; cv.height=V.h; updateSrcName();
+  setStatus('loaded '+V.samples.length+'v'+(V.hasAudio?('/'+aSamples.length+'a'):'')+' @ '+V.w+'x'+V.h,'ok');
 }
 
-function makeDecoder(){
-  dec = new VideoDecoder({
-    output: f => { frameQueue.push({ frame:f, t: f.timestamp/1e6 }); },
-    error: e => setStatus('decoder error: '+e.message,'bad')
-  });
+function makeVideoDecoder(){
+  dec = new VideoDecoder({ output:f=>{ frameQueue.push({frame:f, t:f.timestamp/1e6}); }, error:e=>setStatus('video decoder error: '+e.message,'bad') });
   dec.configure(V.cfg);
 }
-function chunk(s){
-  return new EncodedVideoChunk({
-    type: s.is_sync?'key':'delta',
-    timestamp: Math.round(s.cts / V.timescale * 1e6),
-    duration: Math.round(s.duration / V.timescale * 1e6),
-    data: s.data
-  });
+function makeAudioDecoder(){
+  try {
+    audioDec = new AudioDecoder({ output:ad=>scheduleAudio(ad), error:e=>setStatus('audio err (video ok): '+e.message,'warn') });
+    audioDec.configure(aCfg);
+    audioActive = true;
+  } catch(e){ audioActive=false; setStatus('audio unavailable, video only','warn'); }
+}
+function vchunk(s){ return new EncodedVideoChunk({ type:s.is_sync?'key':'delta', timestamp:Math.round(s.cts/V.timescale*1e6), duration:Math.round(s.duration/V.timescale*1e6), data:s.data }); }
+function achunk(s){ return new EncodedAudioChunk({ type:'key', timestamp:Math.round(s.cts/aTimescale*1e6), duration:Math.round(s.duration/aTimescale*1e6), data:s.data }); }
+
+function scheduleAudio(ad){
+  try {
+    if (!audioCtx){ ad.close(); return; }
+    const nc=ad.numberOfChannels, nf=ad.numberOfFrames, sr=ad.sampleRate;
+    const buf=audioCtx.createBuffer(nc,nf,sr);
+    for (let c=0;c<nc;c++){ const tmp=new Float32Array(nf); ad.copyTo(tmp,{planeIndex:c,format:'f32-planar'}); buf.copyToChannel(tmp,c); }
+    const t=ad.timestamp/1e6; ad.close();
+    const when=epochStart+t;
+    const src=audioCtx.createBufferSource(); src.buffer=buf; src.connect(audioCtx.destination);
+    src.start(when<audioCtx.currentTime?audioCtx.currentTime:when);
+    scheduledSources.push(src);
+    src.onended=()=>{ const i=scheduledSources.indexOf(src); if(i>=0) scheduledSources.splice(i,1); };
+  } catch(e){ try{ad.close();}catch(_){} }
 }
 
-function feed(){
+function videoFeed(){
   if (!playing) return;
   while (dec && dec.state==='configured' && dec.decodeQueueSize<8 && frameQueue.length<12 && sampleIdx<V.samples.length){
-    dec.decode(chunk(V.samples[sampleIdx++]));
+    dec.decode(vchunk(V.samples[sampleIdx++]));
   }
   if (sampleIdx>=V.samples.length && frameQueue.length===0 && dec && dec.decodeQueueSize===0){
     if ($('#loop').checked) restart();
-    else { setStatus('ended','mut'); pause(); updateHUD(baseT); return; }
+    else { setStatus('ended','mut'); pause(); updateHUD(lastVideoPts); return; }
   }
-  feedId = setTimeout(feed, 15);
+  feedId = setTimeout(videoFeed, 15);
+}
+function audioFeed(){
+  if (!playing || !audioActive) return;
+  while (audioDec && audioDec.state==='configured' && audioDec.decodeQueueSize<30 && aIdx<aSamples.length){
+    audioDec.decode(achunk(aSamples[aIdx++]));
+  }
+  aFeedId = setTimeout(audioFeed, 20);
 }
 
 function restart(){
   frameQueue.forEach(o=>o.frame.close()); frameQueue=[];
-  try { dec.reset(); dec.configure(V.cfg); } catch(e){ makeDecoder(); }
-  sampleIdx=0; startClock=performance.now(); baseT=0;
+  try { dec.reset(); dec.configure(V.cfg); } catch(e){ makeVideoDecoder(); }
+  sampleIdx=0;
+  if (audioActive){
+    scheduledSources.forEach(s=>{try{s.stop();}catch(e){}}); scheduledSources=[];
+    try { audioDec.reset(); audioDec.configure(aCfg); } catch(e){ makeAudioDecoder(); }
+    aIdx=0; epochStart = audioCtx.currentTime + 0.1;
+  } else { startClock=performance.now(); baseT=0; }
 }
 
+function mediaClock(now){
+  if (audioActive && audioCtx) return audioCtx.currentTime - epochStart;
+  return (now-startClock)/1000 + baseT;
+}
 function render(now){
   if (!playing) return;
-  const clock = (now-startClock)/1000 + baseT;
+  const clock = mediaClock(now);
   let toDraw=null;
   while (frameQueue.length && frameQueue[0].t <= clock){
     if (toDraw){ toDraw.frame.close(); dropped++; }
     toDraw = frameQueue.shift();
   }
-  if (toDraw){
-    ctx.drawImage(toDraw.frame,0,0,cv.width,cv.height);
-    lastRes = toDraw.frame.displayWidth+'x'+toDraw.frame.displayHeight;
-    toDraw.frame.close(); drawn++; fpsCount++;
-  }
+  if (toDraw){ ctx.drawImage(toDraw.frame,0,0,cv.width,cv.height); lastRes=toDraw.frame.displayWidth+'x'+toDraw.frame.displayHeight; lastVideoPts=toDraw.t; toDraw.frame.close(); drawn++; fpsCount++; }
   if (now-lastFpsT>=1000){ fps=fpsCount; fpsCount=0; lastFpsT=now; }
   updateHUD(clock);
   rafId = requestAnimationFrame(render);
 }
 
 function updateHUD(clock){
-  const behind = frameQueue.length;
-  $('#hud').innerHTML =
-    row('playback time', clock.toFixed(2)+'s') +
-    row('render fps', fps + (V.fileFps?(' / '+V.fileFps+' src'):''), fps>0 && (!V.fileFps||fps>=V.fileFps-2)?'ok':'warn') +
-    row('decoded res', lastRes, 'mut') +
+  let r = row('playback time', clock.toFixed(2)+'s') +
+    row('render fps', fps+(V.fileFps?(' / '+V.fileFps+' src'):''), fps>0&&(!V.fileFps||fps>=V.fileFps-2)?'ok':'warn') +
+    row('decoded res', lastRes,'mut') +
     row('frames drawn', drawn,'ok') +
-    row('frames DROPPED', dropped, dropped>0?(dropped>drawn*0.05?'bad':'warn'):'ok') +
-    row('decode queue', dec?dec.decodeQueueSize:'-') +
-    row('frame buffer', behind, behind>0?'ok':'warn') +
-    row('decoder state', dec?dec.state:'-');
+    row('frames DROPPED', dropped, dropped>0?(dropped>drawn*0.05?'bad':'warn'):'ok');
+  if (V.hasAudio){
+    const drift=(clock-lastVideoPts)*1000;
+    r += row('audio', audioActive?('ON '+aSampleRate+'Hz x'+aChannels):'off', audioActive?'ok':'warn') +
+         row('A/V drift', (isFinite(drift)?drift.toFixed(0):'-')+' ms', Math.abs(drift)<60?'ok':'warn') +
+         row('audio ctx', audioCtx?audioCtx.state:'-', audioCtx&&audioCtx.state==='running'?'ok':'warn');
+  }
+  r += row('decode queue', dec?dec.decodeQueueSize:'-') +
+       row('frame buffer', frameQueue.length, frameQueue.length>0?'ok':'warn') +
+       row('decoder state', dec?dec.state:'-');
+  $('#hud').innerHTML = r;
 }
 
-async function ensureLoadedAndPlay(){
+async function startFresh(){
   if (!loaded) await load();
-  if (!dec || dec.state==='closed') makeDecoder();
+  makeVideoDecoder();
+  if (V.hasAudio){ if(!audioCtx){ try{ audioCtx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ audioCtx=null; } } if(audioCtx){ try{ await audioCtx.resume(); }catch(e){} makeAudioDecoder(); } else audioActive=false; }
+  else audioActive=false;
+  sampleIdx=0; aIdx=0; drawn=0; dropped=0; fps=0; fpsCount=0; lastRes='-'; lastVideoPts=0;
+  frameQueue.forEach(o=>o.frame.close()); frameQueue=[];
+  if (audioActive){ epochStart = audioCtx.currentTime + 0.15; } else { startClock=performance.now(); baseT=0; }
+  playing=true; started=true; $('#play').innerHTML='&#10073;&#10073; Pause'; lastFpsT=performance.now();
+  videoFeed(); if (audioActive) audioFeed(); rafId=requestAnimationFrame(render);
+  setStatus('playing'+(audioActive?' + audio':' (silent)'),'ok');
+}
+async function resume(){
   playing=true; $('#play').innerHTML='&#10073;&#10073; Pause';
-  startClock=performance.now(); lastFpsT=performance.now();
-  feed(); rafId=requestAnimationFrame(render);
+  if (audioActive && audioCtx){ try{ await audioCtx.resume(); }catch(e){} } else { startClock=performance.now(); }
+  lastFpsT=performance.now();
+  videoFeed(); if (audioActive) audioFeed(); rafId=requestAnimationFrame(render);
   setStatus('playing','ok');
 }
 async function toggle(){
   if (playing){ pause(); return; }
-  try { await ensureLoadedAndPlay(); } catch(e){ setStatus('error: '+e.message,'bad'); }
+  try { if (!started) await startFresh(); else await resume(); } catch(e){ setStatus('error: '+e.message,'bad'); }
 }
 function pause(){
   if (!playing) return;
   playing=false; $('#play').innerHTML='&#9654; Play';
   if (feedId) clearTimeout(feedId);
+  if (aFeedId) clearTimeout(aFeedId);
   if (rafId) cancelAnimationFrame(rafId);
-  baseT = baseT + (performance.now()-startClock)/1000;
+  if (audioActive && audioCtx){ audioCtx.suspend(); } else { baseT += (performance.now()-startClock)/1000; }
   setStatus('paused','mut');
 }
 function resetState(){
-  pause(); loaded=false; sampleIdx=0; baseT=0; drawn=0; dropped=0; fps=0; fpsCount=0; lastRes='-'; V.w=0;
+  pause();
+  loaded=false; started=false; sampleIdx=0; aIdx=0; baseT=0; drawn=0; dropped=0; fps=0; fpsCount=0; lastRes='-'; V.w=0; V.hasAudio=false; audioActive=false; lastVideoPts=0;
   frameQueue.forEach(o=>o.frame.close()); frameQueue=[];
+  scheduledSources.forEach(s=>{try{s.stop();}catch(e){}}); scheduledSources=[];
   if (dec){ try{dec.close();}catch(e){} dec=null; }
+  if (audioDec){ try{audioDec.close();}catch(e){} audioDec=null; }
+  if (audioCtx){ try{audioCtx.close();}catch(e){} audioCtx=null; }
 }
 async function pickSource(v, btnId){
   resetState();
-  chosenFile=null; $('#file').value=''; $('#src').value=v; setActive(btnId);
-  updateSrcName();
-  try { await ensureLoadedAndPlay(); updateSrcName(); } catch(e){ setStatus('error: '+e.message,'bad'); }
+  chosenFile=null; $('#file').value=''; $('#src').value=v; setActive(btnId); updateSrcName();
+  try { await startFresh(); updateSrcName(); } catch(e){ setStatus('error: '+e.message,'bad'); }
 }
 async function pickCustom(){
-  resetState();
-  chosenFile=null; setActive(null);
-  updateSrcName();
-  try { await ensureLoadedAndPlay(); updateSrcName(); } catch(e){ setStatus('error: '+e.message,'bad'); }
+  resetState(); chosenFile=null; setActive(null); updateSrcName();
+  try { await startFresh(); updateSrcName(); } catch(e){ setStatus('error: '+e.message,'bad'); }
 }
-function reloadSrc(){
-  resetState();
-  updateSrcName();
-  load().then(updateSrcName).catch(e=>setStatus('error: '+e.message,'bad'));
-}
+function reloadSrc(){ resetState(); updateSrcName(); load().then(updateSrcName).catch(e=>setStatus('error: '+e.message,'bad')); }
 
-updateSrcName();
-updateHUD(0);
+updateSrcName(); updateHUD(0);
 </script>
 </body>
 </html>
